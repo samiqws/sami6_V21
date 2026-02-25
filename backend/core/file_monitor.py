@@ -23,43 +23,34 @@ class FileIntegrityMonitor:
         self.file_metadata: Dict[str, dict] = {}
         self.monitored_paths: Set[str] = set()
     
-    def calculate_hash(self, file_path: str) -> Optional[str]:
-        """Calculate SHA-256 hash of file (OPTIMIZED - uses async calculator)"""
+    def get_file_metrics(self, file_path: str) -> Dict:
+        """Get both hash and entropy in a single optimized call"""
         try:
             entropy_calc = get_entropy_calculator()
             result = entropy_calc.calculate_entropy_sync(file_path)
-            return result['hash'] if result else None
+            if result:
+                return {
+                    "hash": result.get('hash'),
+                    "entropy": result.get('entropy')
+                }
         except Exception as e:
-            logger.error(f"Hash calculation failed for {file_path}: {e}")
-            return None
-    
-    def calculate_entropy(self, file_path: str) -> Optional[float]:
-        """
-        Calculate Shannon entropy of file contents (OPTIMIZED - async with caching).
-        High entropy (>7.0) suggests encryption or compression.
-        """
-        try:
-            entropy_calc = get_entropy_calculator()
-            result = entropy_calc.calculate_entropy_sync(file_path)
-            return result['entropy'] if result else None
-        except Exception as e:
-            logger.error(f"Entropy calculation failed for {file_path}: {e}")
-            return None
-    
+            logger.error(f"Failed to get file metrics for {file_path}: {e}")
+
+        return {"hash": None, "entropy": None}
+
     def get_file_info(self, file_path: str) -> dict:
         """Get comprehensive file information"""
         try:
             stat_info = os.stat(file_path)
-            file_hash = self.calculate_hash(file_path)
-            entropy = self.calculate_entropy(file_path)
+            metrics = self.get_file_metrics(file_path)
             
             return {
                 "path": file_path,
-                "hash": file_hash,
+                "hash": metrics["hash"],
                 "size": stat_info.st_size,
                 "modified": datetime.fromtimestamp(stat_info.st_mtime),
                 "created": datetime.fromtimestamp(stat_info.st_ctime),
-                "entropy": entropy,
+                "entropy": metrics["entropy"],
                 "extension": os.path.splitext(file_path)[1].lower()
             }
         except Exception as e:
@@ -229,37 +220,15 @@ class RansomwareEventHandler(FileSystemEventHandler):
                 if is_user_file and not self.monitoring_config.is_user_files_enabled():
                     return  # تجاهل ملفات المستخدم إذا كانت معطلة
             
-            # النسخ الاحتياطي التلقائي قبل التعديل
-            if self.file_protector and event_type == "modified" and os.path.exists(file_path):
-                self.file_protector.create_backup(file_path)
-            
-            # Get actual process that modified the file
-            process_info = self.get_process_info(file_path)
-            
-            # ✅ WHITELIST CHECK - Skip analysis for trusted processes
-            whitelist = get_whitelist_manager()
-            if whitelist.is_whitelisted(
-                process_name=process_info.get('name'),
-                process_path=process_info.get('exe')
-            ):
-                logger.debug(f"Whitelisted process {process_info.get('name')} - skipping analysis")
-                return  # Skip analysis for trusted process
-            
-            # Verify file integrity
-            integrity_result = None
-            if event_type in ["modified", "created"] and os.path.exists(file_path):
-                integrity_result = self.file_monitor.verify_integrity(file_path)
-            
+            # Minimal event data to avoid blocking the watchdog thread
             event_data = {
                 "type": event_type,
                 "path": file_path,
                 "old_path": old_path,
-                "timestamp": datetime.now(timezone.utc),
-                "process": process_info,
-                "integrity": integrity_result
+                "timestamp": datetime.now(timezone.utc)
             }
             
-            # Call the callback (it will handle async execution)
+            # Call the callback (it will handle the heavy lifting asynchronously)
             if self.callback:
                 self.callback(event_data)
         except Exception as e:

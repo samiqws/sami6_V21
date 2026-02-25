@@ -59,6 +59,7 @@ with open(config_path, 'r') as f:
 active_incidents: Dict[str, dict] = {}
 connected_clients: Set[WebSocket] = set()
 system_running: bool = True  # System monitoring state
+event_queue: asyncio.Queue = asyncio.Queue()
 
 
 @asynccontextmanager
@@ -245,6 +246,41 @@ async def lifespan(app: FastAPI):
     # Start the cache update task
     app.state.cache_update_task = asyncio.create_task(update_monitored_files_cache())
     
+    # Start background task to process event queue for batch database insertion
+    async def process_event_queue():
+        """Background task to batch insert file events into the database"""
+        while True:
+            events_to_insert = []
+            try:
+                # Wait for at least one event
+                first_event = await event_queue.get()
+                events_to_insert.append(first_event)
+
+                # Collect more events if available (up to 100 or until queue empty)
+                while len(events_to_insert) < 100:
+                    try:
+                        next_event = event_queue.get_nowait()
+                        events_to_insert.append(next_event)
+                    except asyncio.QueueEmpty:
+                        break
+
+                # Batch insert
+                async with db.async_session() as session:
+                    for event_obj in events_to_insert:
+                        session.add(event_obj)
+                    await session.commit()
+
+                for _ in range(len(events_to_insert)):
+                    event_queue.task_done()
+
+                logger.debug(f"Batch inserted {len(events_to_insert)} events")
+
+            except Exception as e:
+                logger.error(f"Error processing event queue: {e}")
+                await asyncio.sleep(1)
+
+    app.state.event_processor_task = asyncio.create_task(process_event_queue())
+
     logger.info("Ransomware Detection Engine is running and ready")
     
     yield
@@ -275,6 +311,39 @@ app.add_middleware(
 async def handle_file_event(event_data: dict):
     """Process file system events"""
     try:
+        file_path = event_data.get("path")
+        event_type = event_data.get("type")
+
+        # 1. Get Process Info (Run in thread pool to avoid blocking event loop)
+        process_info = await asyncio.to_thread(
+            app.state.monitor.event_handler.get_process_info,
+            file_path
+        )
+        event_data["process"] = process_info
+
+        # 2. Whitelist check
+        from core.whitelist_manager import get_whitelist_manager
+        whitelist = get_whitelist_manager()
+        if whitelist.is_whitelisted(
+            process_name=process_info.get('name'),
+            process_path=process_info.get('exe')
+        ):
+            return
+
+        # 3. Create backup (if enabled and modified)
+        if app.state.file_protector and event_type == "modified" and os.path.exists(file_path):
+            await asyncio.to_thread(app.state.file_protector.create_backup, file_path)
+
+        # 4. Verify file integrity
+        if event_type in ["modified", "created"] and os.path.exists(file_path):
+            integrity_result = await asyncio.to_thread(
+                app.state.monitor.event_handler.file_monitor.verify_integrity,
+                file_path
+            )
+            event_data["integrity"] = integrity_result
+        else:
+            event_data["integrity"] = None
+
         # Run detection analysis
         detection_result = await app.state.detector.analyze_event(event_data)
         
@@ -289,32 +358,19 @@ async def handle_file_event(event_data: dict):
                 "recommended_action": "monitor"
             }
         
-        # Store event in database with retry logic
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                async with db.async_session() as session:
-                    file_event = FileEvent(
-                        event_type=event_data.get("type"),
-                        file_path=event_data.get("path"),
-                        file_hash=event_data.get("integrity", {}).get("current_hash") if event_data.get("integrity") else None,
-                        entropy=event_data.get("integrity", {}).get("current_entropy") if event_data.get("integrity") else None,
-                        process_name=event_data.get("process", {}).get("name") if event_data.get("process") else None,
-                        process_id=event_data.get("process", {}).get("pid") if event_data.get("process") else None,
-                        suspicious=detection_result.get("suspicious", False),
-                        threat_level=detection_result.get("threat_level", "none"),
-                        is_decoy=app.state.decoy_manager.is_decoy_file(event_data.get("path"))
-                    )
-                    session.add(file_event)
-                    await session.commit()
-                    break  # Success, exit retry loop
-            except Exception as db_error:
-                if "locked" in str(db_error).lower() and attempt < max_retries - 1:
-                    await asyncio.sleep(0.1 * (attempt + 1))  # Exponential backoff
-                    continue
-                elif attempt == max_retries - 1:
-                    logger.warning(f"Failed to store event after {max_retries} attempts: {db_error}")
-                    break
+        # Queue event for batch database insertion
+        file_event = FileEvent(
+            event_type=event_data.get("type"),
+            file_path=event_data.get("path"),
+            file_hash=event_data.get("integrity", {}).get("current_hash") if event_data.get("integrity") else None,
+            entropy=event_data.get("integrity", {}).get("current_entropy") if event_data.get("integrity") else None,
+            process_name=event_data.get("process", {}).get("name") if event_data.get("process") else None,
+            process_id=event_data.get("process", {}).get("pid") if event_data.get("process") else None,
+            suspicious=detection_result.get("suspicious", False),
+            threat_level=detection_result.get("threat_level", "none"),
+            is_decoy=app.state.decoy_manager.is_decoy_file(event_data.get("path"))
+        )
+        await event_queue.put(file_event)
         
         # Handle threats
         if detection_result.get("suspicious"):
