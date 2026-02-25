@@ -41,6 +41,11 @@ class RansomwareDetector:
             process_info = event_data.get("process", {})
             integrity_info = event_data.get("integrity", {})
             
+            process_name = process_info.get("name", "unknown")
+            process_pid = process_info.get("pid", 0)
+            # Use combined ID for accurate tracking
+            process_id = f"{process_name}:{process_pid}"
+
             detection_result = {
                 "suspicious": False,
                 "threat_level": "none",
@@ -57,7 +62,7 @@ class RansomwareDetector:
             if decoy_check.get("is_decoy") and decoy_check.get("compromised"):
                 indicators.append("decoy_file_compromised")
                 threat_score += 50
-                logger.warning(f"DECOY FILE COMPROMISED: {file_path}")
+                logger.warning(f"DECOY FILE COMPROMISED: {file_path} by {process_id}")
             
             # 2. Check entropy (encryption indicator)
             if integrity_info:
@@ -70,11 +75,9 @@ class RansomwareDetector:
             if integrity_info and integrity_info.get("extension_changed"):
                 indicators.append("extension_changed")
                 threat_score += 20
-                process_name = process_info.get("name", "unknown")
-                self.extension_changes[process_name] += 1
+                self.extension_changes[process_id] += 1
             
             # 4. Track rapid file modifications
-            process_name = process_info.get("name", "unknown")
             
             # Skip tracking for our own process
             if process_name.lower() in ["python.exe", "pythonw.exe"]:
@@ -84,22 +87,22 @@ class RansomwareDetector:
                     # Don't track our own file operations
                     return detection_result
             
-            self.file_modifications[process_name].append(timestamp)
+            self.file_modifications[process_id].append(timestamp)
             
             # Clean old entries
             cutoff_time = timestamp - self.detection_window
-            self.file_modifications[process_name] = [
-                t for t in self.file_modifications[process_name] if t > cutoff_time
+            self.file_modifications[process_id] = [
+                t for t in self.file_modifications[process_id] if t > cutoff_time
             ]
             
-            modification_rate = len(self.file_modifications[process_name])
+            modification_rate = len(self.file_modifications[process_id])
             if modification_rate > self.rapid_change_threshold:
                 indicators.append("rapid_file_modifications")
                 threat_score += 40
-                logger.warning(f"Rapid modifications detected: {process_name} - {modification_rate} files")
+                logger.warning(f"Rapid modifications detected: {process_id} - {modification_rate} files")
             
             # 5. Check for mass extension changes
-            if self.extension_changes[process_name] > self.extension_change_threshold:
+            if self.extension_changes[process_id] > self.extension_change_threshold:
                 indicators.append("mass_extension_changes")
                 threat_score += 35
             
@@ -153,12 +156,12 @@ class RansomwareDetector:
         """Get list of processes with suspicious activity"""
         suspicious = []
         
-        for process_name, count in self.extension_changes.items():
+        for process_id, count in self.extension_changes.items():
             if count > self.extension_change_threshold:
                 suspicious.append({
-                    "process": process_name,
+                    "process": process_id,
                     "extension_changes": count,
-                    "file_modifications": len(self.file_modifications.get(process_name, []))
+                    "file_modifications": len(self.file_modifications.get(process_id, []))
                 })
         
         return suspicious

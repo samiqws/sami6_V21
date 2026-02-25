@@ -48,10 +48,26 @@ class WhitelistManager:
         # System Tools
         'explorer.exe': 'Windows Explorer',
         'taskmgr.exe': 'Task Manager',
+        'svchost.exe': 'Service Host',
+        'lsass.exe': 'LSA Shell',
+        'services.exe': 'Services',
+        'wininit.exe': 'Windows Initialization',
+        'smss.exe': 'Session Manager',
+        'csrss.exe': 'Client Server Runtime',
+        'searchindexer.exe': 'Windows Search Indexer',
+        'dllhost.exe': 'COM Surrogate',
+        'conhost.exe': 'Console Window Host',
+        'runtimebroker.exe': 'Runtime Broker',
+        'shellexperiencehost.exe': 'Shell Experience Host',
+
+        # Anti-Virus & Security
+        'msmpeng.exe': 'Windows Defender',
+        'nissrv.exe': 'Windows Defender Network Inspection',
         
         # Compression Tools
         'winrar.exe': 'WinRAR',
         '7zg.exe': '7-Zip',
+        '7z.exe': '7-Zip Console',
         
         # Adobe
         'acrobat.exe': 'Adobe Acrobat',
@@ -146,17 +162,35 @@ class WhitelistManager:
             process_name_lower = process_name.lower()
             if process_name_lower in self.whitelist:
                 self.whitelist_hits += 1
-                logger.debug(f"Process whitelisted: {process_name}")
+                logger.debug(f"Process whitelisted by name: {process_name}")
                 return True
         
         # Check by full path
         if process_path:
             process_path_normalized = os.path.normpath(process_path).lower()
+
+            # Check direct path whitelist
             if process_path_normalized in self.whitelist_paths:
                 self.whitelist_hits += 1
-                logger.debug(f"Path whitelisted: {process_path}")
+                logger.debug(f"Path whitelisted directly: {process_path}")
                 return True
-        
+
+            # Smart folder-based whitelisting for critical system folders
+            # Requires process to be in a known safe system folder AND be a known system process
+            system_folders = [
+                'c:\\windows\\system32\\',
+                'c:\\windows\\syswow64\\',
+                'c:\\windows\\winsxs\\'
+            ]
+
+            if any(process_path_normalized.startswith(folder) for folder in system_folders):
+                # Only trust if it's also a known system process name to prevent
+                # ransomware from running out of system folders (rare but possible)
+                if process_name and process_name.lower() in self.whitelist:
+                    self.whitelist_hits += 1
+                    logger.debug(f"Process whitelisted by system path + name: {process_path}")
+                    return True
+
         return False
     
     def add_to_whitelist(self, process_name: str, description: str = "", 
